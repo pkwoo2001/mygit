@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -92,10 +93,30 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
-
+   /*알람 클락 추가 구현*/
+    int64_t wakeup; // 일어날 tick: cur_tick + 잠자는 시간
+   /*donation 추가 구현*/
+   struct list donators_list; // donate 해준 threads
+   struct list_elem donate_elem; // donators list_elem
+   int own_priority; // 원래 자신의 priority
+   struct lock* waiting_lock; // thread가 acuire한 lock: 기다리고 있음
+   /*advanced scheduler 추가 구현*/
+   int nice;
+   int recent_cpu;
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct list child_list;
+    struct list_elem child_list_elem;
+    struct semaphore wait_child_sema; // 부모가 child 끝날때까지 대기
+    struct semaphore wait_parent_sema; // child가 부모가 exit_status 받을때까지 대기
+    struct semaphore load_sema;
+    struct semaphore wait_parent_load_error; // load error 받기 위해 대기
+    bool waited; // parent가 wait 호출했는지 유무
+    bool loaded; // load되었는지 유무
+    int exit_status;
+    struct file* fd[128];
+    struct file* exec_file;
 #endif
 
     /* Owned by thread.c. */
@@ -137,5 +158,33 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+/*ass1 알람 클락 구현 추가 함수*/
+void thread_sleep(struct thread *cur_thread, int64_t tick);
+bool compare_tick_increasing (const struct list_elem *prev, const struct list_elem *next);
+void thread_wake (int64_t cur_tick);
+/*ass1 priority scheduler 추가 구현 함수*/
+bool compare_priority_decreasing (const struct list_elem *prev, const struct list_elem *next, void *aux UNUSED);
+bool check_priority_yield(void); //ready_list 첫번째 element랑 비교해서 current thread priority가 더 작으면 yield
+/*inversion 추가 구현*/
+void sorting_ready_list(void);
+bool donator_p_decreaing(const struct list_elem *prev, const struct list_elem *next, void *aux UNUSED);
+/*advanced scheduler 추가 구현 함수*/
+int int2fp(int n);
+int fp2int(int x);
+int fp2int_round(int x);
+int add_fp(int x, int y);
+int sub_fp(int x, int y);
+int add_fp_int(int x, int n);
+int sub_fp_int(int x, int n);
+int mul_fp(int x, int y);
+int mul_fp_int(int x, int n);
+int div_fp(int x, int y);
+int div_fp_int(int x, int n);
+void mlfqs_recal_priority (void);
+void mlfqs_recal_recentcpu(void);
+void mlfqs_cal_load_avg (void);
+void mlfqs_increment_recent_cpu (void);
+void update_thread_state(const int64_t ticks);
 
 #endif /* threads/thread.h */

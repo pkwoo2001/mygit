@@ -20,6 +20,7 @@
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+void construct_stack(char *file_name, void **esp);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -30,42 +31,91 @@ process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
-
+  /*project2 추가*/
+  struct list *child_list = &(thread_current()->child_list);
+  struct list_elem *child;
+  struct thread *child_thread;
+  char *save_ptr;
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
-
+  char *program_name = malloc( (strlen(fn_copy) + 1) * sizeof(char) ); 
+  strlcpy(program_name, fn_copy, (strlen(fn_copy) + 1) * sizeof(char) ); 
+  program_name = strtok_r(program_name, " ", &save_ptr); 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (program_name, PRI_DEFAULT, start_process, fn_copy);
+  free(program_name);
   if (tid == TID_ERROR)
+  {
     palloc_free_page (fn_copy); 
+    return -1;
+  }
+
+ for(child = list_begin(child_list); child != list_end(child_list); child= list_next(child))
+ {
+  child_thread = list_entry(child, struct thread, child_list_elem);
+  if(child_thread->tid == tid)
+  {
+    break;
+  }
+ }
+  /*load가 끝날 때까지 대기, 실패시 -1 리턴 Project2 */
+  sema_down(&child_thread->load_sema); // load 시킨 child 대기 load 할때까지
+  if(child_thread->loaded == 0)
+  {
+   sema_up(&child_thread->wait_parent_load_error);
+   return -1;
+  }
+
+  /*..........................*/
   return tid;
 }
+
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
 start_process (void *file_name_)
 {
+  int argc;
+  char *argv[128];
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
-
+  //argc = parse_file_name(file_name, argv);
+  //printf("argc: %d\n",argc);
+  //printf("argv[0]: %s\n",argv[0]);
+  //printf("argv[1]: %s\n",argv[1]);
+  //char *program_name = argv[0]; 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
+  //printf("here%s",file_name); echo x
   success = load (file_name, &if_.eip, &if_.esp);
 
+  if(success)
+    //push_stack_arg(&if_.esp,argv,argc);
+    construct_stack(file_name,&if_.esp);
+  //printf("hex dump in construct_stack start\n\n");
+  //hex_dump(if_.esp,if_.esp, 100, true);
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
+  if(success) // 성공 load
+  {
+    thread_current()->loaded=1;
+    sema_up(&thread_current()->load_sema);
+  }
+  else{ // load 실패
+    thread_current()->loaded=0;
+    sema_up(&thread_current()->load_sema); 
+    sema_down(&thread_current()->wait_parent_load_error); 
     thread_exit ();
-
+  }
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
@@ -86,9 +136,44 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
+bool child_exist=0;
+struct thread *cur = thread_current();
+struct list *children = &(cur-> child_list);
+struct thread *child_thread;
+struct list_elem *child;
+//child_tid에 해당하는 child 찾는과정
+child=list_begin(children);
+while( child != list_end(children))
+{
+  child_thread = list_entry(child, struct thread, child_list_elem);
+  if(child_thread->tid == child_tid)
+  {
+    child_exist=1;
+    break;
+  }
+  child= list_next(child);
+}
+// child_tid에 해당하는 child가 없는 경우
+ if(!child_exist)
+ {
   return -1;
+ }
+ // 이미 child에 대해 call 한적 있는 경우
+ if (child_thread->waited == true)
+ {
+  return -1;
+ }
+ // child가 끝날 때까지 부모는 대기
+ child_thread->waited = true;
+ sema_down(&(child_thread->wait_child_sema));
+
+ // child 제거, exit_status 받기 전까진 child 안없어짐, 그 후 wait_parent_sema up
+ int exit_status = child_thread->exit_status;
+ list_remove(&(child_thread->child_list_elem));
+ sema_up(&(child_thread->wait_parent_sema));
+ return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -98,6 +183,7 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  file_close(cur->exec_file);
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -114,7 +200,13 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+
+  // parent thread 해방. 
+  sema_up(&(cur->wait_child_sema));
+  // 부모가 exit_status 받을 때까지 대기
+  sema_down(&(cur->wait_parent_sema));
 }
+
 
 /* Sets up the CPU for running user code in the current
    thread.
@@ -220,14 +312,24 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
-
+  
+  //added
+  char* save_ptr;
+  char *fn_copy = malloc(sizeof(char)*(strlen(file_name)+1));
+  strlcpy(fn_copy, file_name, (strlen(file_name)+1));
+  fn_copy[strlen(file_name)]='\0';
+  char *program_name = strtok_r(fn_copy, " ", &save_ptr);
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (program_name);
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+
+  //for problem4 deny write
+  t->exec_file=file;
+  file_deny_write(file);
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -312,7 +414,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  //file_close (file);
   return success;
 }
 
@@ -463,3 +565,59 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
+void construct_stack(char *file_name, void **esp) {
+  int argc = 0;
+  int i, token_len;
+  int total_len = 0;
+  char file_copy[128];
+  char ** argv;
+  char *token,*save_ptr;
+  strlcpy(file_copy, file_name, strlen(file_name) + 1);
+
+  for(token = strtok_r(file_copy," ", &save_ptr);token != NULL; token = strtok_r(NULL, " ",&save_ptr)){
+    argc ++;
+  }
+  //token = strtok_r(file_copy, " ", &save_ptr);
+  /* calculate argc */
+  /*while (token != NULL) {
+    argc += 1;
+    token = strtok_r(NULL, " ", &save_ptr);
+  }*/
+  argv = (char **)malloc(sizeof(char *) * argc);
+  strlcpy(file_copy, file_name, strlen(file_name) + 1);
+  for (i = 0, token = strtok_r(file_copy, " ", &save_ptr); i < argc; i++, token = strtok_r(NULL, " ", &save_ptr)) {
+    token_len = strlen(token);
+    argv[i] = token;
+  }
+  //push argv[i][]
+  for (i = argc - 1; i >= 0; i --) {
+    token_len = strlen(argv[i]) + 1; 
+    *esp -= token_len; 
+    memcpy(*esp, argv[i], token_len);
+    total_len += (token_len+1);
+    argv[i] = *esp; 
+  }
+  //word align
+  *esp -= total_len % 4 != 0 ? 4 - (total_len % 4) : 0;
+  //null
+  *esp -= 4;
+  **(uint32_t **)esp = 0;
+  //push stack address argv[i]
+  for (i = argc - 1; 0 <= i; i--) {
+    *esp -= 4;
+    **(uint32_t **)esp = argv[i];
+  }
+  //pusth argv start address
+  *esp -= 4;
+  **(uint32_t **)esp = *esp + 4;
+
+  //argc
+  *esp -= 4;
+  **(uint32_t **)esp = argc;
+  
+  //return address
+  *esp -= 4;
+  **(uint32_t **)esp = 0;
+}
+

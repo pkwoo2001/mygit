@@ -2,5 +2,7 @@
 #define USERPROG_SYSCALL_H
 
 void syscall_init (void);
+typedef int pid_t;
+struct lock fs_lock;
 
 #endif /* userprog/syscall.h */
